@@ -19,9 +19,13 @@ PYTHONPATH=$(git rev-parse --show-toplevel) python validate_field_solver.py
 - [x] **M2 — Deposition** (`deposition_jax.py`): vectorized masked scatter with the quadratic
       (C1) shape, central-cell antisymmetry, boundary clamp. Matches numba to 2.9e-11 (tol 5e-11);
       differentiable w.r.t. particle position (grad vs FD ~2e-9).
-- [ ] M3 — Particle push (`vmap` over particles; boundary/loss via masks; substepping).
-- [ ] M4 — Assemble one ξ-layer, then the full ξ-march via `lax.scan` + `jax.checkpoint`.
-- [ ] M5 — Full single time step; validate vs LCODE at a relaxed tolerance; grad demo.
+- [x] **M3 — Particle push** (`move_jax.py`): vectorized Lorentz push (branches → `jnp.where`)
+      + substepping as a **bounded `lax.scan`** (reverse-mode grad does not work through
+      `lax.while_loop`). Matches numba mover to 4.5e-13 (inside 1e-12 tol); differentiable
+      (grad vs FD ~2e-8).
+- [ ] M4 — Assemble one ξ-layer (predictor/corrector), then the full ξ-march via `lax.scan`
+      + `jax.checkpoint`.
+- [ ] M5 — Full single time step incl. beam; validate vs LCODE at a relaxed tolerance; grad demo.
 
 ## M1 results (2026-07-01, CPU, float64)
 - **Accuracy vs numba `compute_fields`** on all 6 reference states: worst **3.9e-12** relative
@@ -40,6 +44,21 @@ differentiates it correctly. The trickiest numerics for Branch 2 are de-risked.
 - **Differentiable:** grad w.r.t. particle position finite & nonzero for all 2000 particles,
   matches finite differences to ~2e-9 for particles interior to a cell. The quadratic C1
   shape keeps deposition smooth — the main differentiability worry is manageable.
+
+## M3 results (2026-07-01, CPU, float64)
+- **Accuracy vs numba mover** on all 6 states: worst **4.5e-13** relative — inside the strict
+  1e-12 pusher tolerance (the push is per-particle elementwise, so it reproduces to round-off).
+- **Differentiable:** grad through the bounded-scan push finite & nonzero, matches finite
+  differences to ~2e-8.
+- **Key control-flow finding:** reverse-mode `grad` fails through `lax.while_loop`
+  (data-dependent trip count) → the adaptive substepping is reformulated as a bounded
+  `lax.scan` with masking (N=64 attempts sufficed for the reference states). Deeply-trapped
+  particles could need more attempts / a smooth relaxation; revisit in M4/M5.
+
+**Status:** all three physics-numerics kernels (field solve, deposition, push) are ported,
+match numba within the respective unit-test tolerances, and are differentiable. The core risk
+of Branch 2 is retired; M4/M5 are assembly (predictor-corrector + ξ-scan + beam) rather than
+new numerical risk.
 
 ## Notes
 - `jax_enable_x64` is required to match numba float64 (JAX defaults to float32).
