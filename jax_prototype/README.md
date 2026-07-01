@@ -28,6 +28,16 @@ PYTHONPATH=$(git rev-parse --show-toplevel) python validate_field_solver.py
       matches numba to mean 5e-9 (max 4e-5 of peak) over 301 layers; gradient through the whole
       march matches finite differences (~1e-4). (Outer step_dxi substepping omitted — weak-driver
       regime; needs a bounded form for the general case, like the mover in M3.)
+### Time dynamics (self-consistent beam evolution)
+- [x] **MB1 — Beam deposition** (`beam_jax.py`): bilinear (xi, r) scatter with the per-layer
+      `rho_layout` carry. Matches numba `deposit_beam_layer` to 2.8e-14 (bit-exact; matches the
+      *recomputed* numba even where the stored file differs by issue #2). Differentiable (grad
+      w.r.t. beam charge ~1e-13).
+- [ ] MB2 — Beam push (evolve beam particles in the wake fields), validate vs numba `push_beam_layer`.
+- [ ] MB3 — Couple beam deposit + push into the ξ-march (one full time step).
+- [ ] MB4 — Outer time loop over N steps; validate beam energy evolution vs numba; differentiable.
+
+### Single-time-step milestones
 - [x] **M5 — Differentiable optimization demo** (`optimize_demo.py`): end-to-end gradient-based
       **inverse design** — a differentiable rigid Gaussian driver feeds the JAX march; `jax.grad`
       (with `jax.checkpoint` for memory) drives Adam to recover the driver radius that produces a
