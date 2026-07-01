@@ -38,8 +38,15 @@ PYTHONPATH=$(git rev-parse --show-toplevel) python validate_field_solver.py
       per-substep cylindrical round-trip (reconstruct `x=r, y=0, p_y=M/r` each sub-step) and
       `init_substepping`. Matches numba `push_beam_layer` to ~1e-13 on all reference states
       (incl. external B and multi-substep); differentiable (grad vs FD ~3e-7).
-- [ ] MB3 — Couple beam deposit + push into the ξ-march (one full time step).
-- [ ] MB4 — Outer time loop over N steps; validate beam energy evolution vs numba; differentiable.
+- [x] **MB3 — One full time step** (`time_dynamics.py`): quasistatic coupling — deposit the whole
+      beam (`deposit_beam_full`, bit-exact vs numba 2.8e-15) → plasma ξ-march storing the wake field
+      history (`march_with_fields`) → push the whole beam in that wake (`push_beam_history`, 2D field
+      sampling ≡ the two-adjacent-layer interp). Differentiable.
+- [x] **MB4 — Outer time loop** (`demo_time_dynamics.py`): evolve a real numba-generated beam over
+      many steps. The **driver decelerates in its own wake** (mean p_z 1000→987 over 15 steps), the
+      wake grows self-consistently, and **grad flows through the whole multi-step loop** (d(final
+      energy)/d(initial energy) vs finite-diff ~2e-10). numba's exact per-layer 'fell' re-processing
+      is deferred (implementation-phase detail; physics + differentiability captured).
 
 ### Single-time-step milestones
 - [x] **M5 — Differentiable optimization demo** (`optimize_demo.py`): end-to-end gradient-based

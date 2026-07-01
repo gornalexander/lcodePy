@@ -74,3 +74,21 @@ def march(init_particles, init_fields, init_currents, rho_beam_seq, p):
     (pf, ff, cf), ez_axis = jax.lax.scan(
         body, (init_particles, init_fields, init_currents), rho_beam_seq)
     return ez_axis, (pf, ff, cf)
+
+
+def march_with_fields(init_particles, init_fields, init_currents, rho_beam_seq, p):
+    """Like `march`, but returns the full wake-field history F[k] for each xi-layer k
+    (a dict of (n_layers, n_cells) arrays), for pushing the beam afterwards (MB3)."""
+    def _step(particles, fields, currents, rho_beam):
+        return step_dxi(particles, fields, currents, rho_beam, p)
+    if p.get("checkpoint", False):
+        _step = jax.checkpoint(_step)
+
+    def body(carry, rho_beam):
+        particles, fields, currents = carry
+        particles, fields, currents = _step(particles, fields, currents, rho_beam)
+        return (particles, fields, currents), fields
+
+    (pf, ff, cf), field_hist = jax.lax.scan(
+        body, (init_particles, init_fields, init_currents), rho_beam_seq)
+    return field_hist, (pf, ff, cf)

@@ -42,6 +42,34 @@ def deposit_beam_layer(rho_layout, r, xi, q_norm, xi_i, r_step, xi_step, n_cells
     return dens, nxt
 
 
+def deposit_beam_full(r, xi, q_norm, n_xi, n_cells, r_step, xi_step):
+    """Deposit the whole beam into rho_beam[n_xi, n_cells] (MB3).
+
+    Global 2D bilinear scatter equivalent to running numba `deposit_beam_layer` over all
+    layers with its rho_layout carry: a particle at xi contributes weight (1-fxi) to layer
+    L=floor(-xi/xi_step) and fxi to layer L+1 (xi-direction), split (1-dr, dr) between radial
+    cells j, j+1. Layer index 0 is the plasma layer xi_i=1 (rho_beam[k] drives xi_i=k+1).
+    """
+    xin = -xi / xi_step
+    L = jnp.floor(xin).astype(jnp.int64)         # row L gets weight (1-fxi), row L+1 gets fxi
+    fxi = xin - jnp.floor(xin)
+    j = jnp.floor(r / r_step).astype(jnp.int64)
+    dr = r / r_step - j
+    # (layer, cell) contributions with weights
+    a_lo = (1.0 - fxi)
+    a_hi = fxi
+    grid = jnp.zeros((n_xi + 2, n_cells + 1))
+    for (lw, dl) in ((a_lo, 0), (a_hi, 1)):
+        for (rw, dj) in ((1.0 - dr, 0), (dr, 1)):
+            grid = grid.at[jnp.clip(L + dl, 0, n_xi + 1), jnp.clip(j + dj, 0, n_cells)].add(lw * rw * q_norm)
+    rho = grid[:n_xi, :n_cells]
+    # per-layer normalisation (as in deposit_beam_layer)
+    rho = rho / r_step ** 2
+    rho = rho.at[:, 0].multiply(6.0)
+    rho = rho.at[:, 1:].divide(jnp.arange(1, n_cells, dtype=rho.dtype)[None, :])
+    return rho
+
+
 # ----------------------------------------------------------------- beam push (MB2)
 def init_substepping(p_z, q_m, dt, remaining_steps, time_step, substepping_energy):
     """Port of numba init_substepping / beam_substepping_step.
