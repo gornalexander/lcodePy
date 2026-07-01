@@ -33,7 +33,11 @@ PYTHONPATH=$(git rev-parse --show-toplevel) python validate_field_solver.py
       `rho_layout` carry. Matches numba `deposit_beam_layer` to 2.8e-14 (bit-exact; matches the
       *recomputed* numba even where the stored file differs by issue #2). Differentiable (grad
       w.r.t. beam charge ~1e-13).
-- [ ] MB2 — Beam push (evolve beam particles in the wake fields), validate vs numba `push_beam_layer`.
+- [x] **MB2 — Beam push** (`beam_jax.py`): two-time-level bilinear field interpolation + the
+      leapfrog integrator + per-particle substepping as a bounded `lax.scan`, with the
+      per-substep cylindrical round-trip (reconstruct `x=r, y=0, p_y=M/r` each sub-step) and
+      `init_substepping`. Matches numba `push_beam_layer` to ~1e-13 on all reference states
+      (incl. external B and multi-substep); differentiable (grad vs FD ~3e-7).
 - [ ] MB3 — Couple beam deposit + push into the ξ-march (one full time step).
 - [ ] MB4 — Outer time loop over N steps; validate beam energy evolution vs numba; differentiable.
 
