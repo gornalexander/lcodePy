@@ -16,8 +16,10 @@ PYTHONPATH=$(git rev-parse --show-toplevel) python validate_field_solver.py
 ## Milestones
 - [x] **M1 — Field solver** (`field_solver_jax.py`): the hardest, sequential-along-r part
       (Thomas tridiagonal solve + cumulative integrals). Ported with `lax.scan` / `cumsum`.
-- [ ] M2 — Deposition (smooth shape functions, `segment_sum`) + interpolation.
-- [ ] M3 — Particle push (`vmap` over particles; boundary/loss via masks).
+- [x] **M2 — Deposition** (`deposition_jax.py`): vectorized masked scatter with the quadratic
+      (C1) shape, central-cell antisymmetry, boundary clamp. Matches numba to 2.9e-11 (tol 5e-11);
+      differentiable w.r.t. particle position (grad vs FD ~2e-9).
+- [ ] M3 — Particle push (`vmap` over particles; boundary/loss via masks; substepping).
 - [ ] M4 — Assemble one ξ-layer, then the full ξ-march via `lax.scan` + `jax.checkpoint`.
 - [ ] M5 — Full single time step; validate vs LCODE at a relaxed tolerance; grad demo.
 
@@ -30,9 +32,14 @@ PYTHONPATH=$(git rev-parse --show-toplevel) python validate_field_solver.py
 - **jit:** ~3.4 µs/call for `compute_fields` E_z on n=201.
 
 **Takeaway:** JAX reproduces the sequential-along-r field solver to round-off *and*
-differentiates it correctly. The trickiest numerics for Branch 2 are de-risked. Next: the
-particle–grid steps (M2/M3), which carry the real differentiability challenge (non-smooth
-deposition / interpolation).
+differentiates it correctly. The trickiest numerics for Branch 2 are de-risked.
+
+## M2 results (2026-07-01, CPU, float64)
+- **Accuracy vs numba `compute_rhoj`** on all 6 states: worst **2.9e-11** relative (inside the
+  5e-11 deposition unit-test tolerance; residual is scatter-order FP, not bit-identical).
+- **Differentiable:** grad w.r.t. particle position finite & nonzero for all 2000 particles,
+  matches finite differences to ~2e-9 for particles interior to a cell. The quadratic C1
+  shape keeps deposition smooth — the main differentiability worry is manageable.
 
 ## Notes
 - `jax_enable_x64` is required to match numba float64 (JAX defaults to float32).
