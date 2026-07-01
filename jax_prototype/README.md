@@ -23,9 +23,14 @@ PYTHONPATH=$(git rev-parse --show-toplevel) python validate_field_solver.py
       + substepping as a **bounded `lax.scan`** (reverse-mode grad does not work through
       `lax.while_loop`). Matches numba mover to 4.5e-13 (inside 1e-12 tol); differentiable
       (grad vs FD ~2e-8).
-- [ ] M4 — Assemble one ξ-layer (predictor/corrector), then the full ξ-march via `lax.scan`
-      + `jax.checkpoint`.
-- [ ] M5 — Full single time step incl. beam; validate vs LCODE at a relaxed tolerance; grad demo.
+- [x] **M4 — ξ-layer + full ξ-march** (`march_jax.py`): predictor/corrector `step_dxi` + the
+      whole march via `lax.scan`, driven by a precomputed per-layer beam density. On-axis Ez(ξ)
+      matches numba to mean 5e-9 (max 4e-5 of peak) over 301 layers; gradient through the whole
+      march matches finite differences (~1e-4). (Outer step_dxi substepping omitted — weak-driver
+      regime; needs a bounded form for the general case, like the mover in M3.)
+- [ ] M5 — Full single time step incl. beam push; validate vs LCODE end-to-end at a relaxed
+      tolerance; gradient-optimisation demo. Also: bounded outer substepping; `jax.checkpoint`
+      for memory on long marches.
 
 ## M1 results (2026-07-01, CPU, float64)
 - **Accuracy vs numba `compute_fields`** on all 6 reference states: worst **3.9e-12** relative
@@ -59,6 +64,16 @@ differentiates it correctly. The trickiest numerics for Branch 2 are de-risked.
 match numba within the respective unit-test tolerances, and are differentiable. The core risk
 of Branch 2 is retired; M4/M5 are assembly (predictor-corrector + ξ-scan + beam) rather than
 new numerical risk.
+
+## M4 results (2026-07-01, CPU, float64)
+- **Full ξ-march** (301 layers) driven by numba's per-layer beam density: on-axis Ez(ξ)
+  matches numba to **mean 5e-9, max 4e-5 of peak** (round-off accumulation over the coupled
+  march). Gradient d(sum Ez^2)/d(beam amplitude) through the whole `lax.scan` matches finite
+  differences to ~1e-4.
+- **Harness lesson:** `Simulation.step()` runs a 2-xi-step warmup (JIT compile) that also
+  calls step_dxi/deposit with a fake beam; capturing per-layer data must disable warmup, or
+  the JAX march is driven by 2 spurious layers (this caused a spurious 3.5% mismatch until
+  found). `validate_march.py` disables warmup during capture.
 
 ## Notes
 - `jax_enable_x64` is required to match numba float64 (JAX defaults to float32).
