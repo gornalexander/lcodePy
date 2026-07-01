@@ -27,11 +27,13 @@ def step_dxi(particles, fields, currents, rho_beam, p):
     n, h, xi = p["n_cells"], p["r_step"], p["xi_step"]
     vol, ni, mr = p["vol"], p["ni"], p["max_radius"]
 
+    n_attempts = p.get("n_attempts", jm.N_SUBSTEP_ATTEMPTS)
+
     def move(f):
         r, pr, pf, pz, q = jm.move_particles(
             f["E_r"], f["E_f"], f["E_z"], f["B_f"], f["B_z"],
             particles["r"], particles["p_r"], particles["p_f"], particles["p_z"],
-            particles["q"], particles["m"], h, xi, mr)
+            particles["q"], particles["m"], h, xi, mr, n_attempts=n_attempts)
         return {"r": r, "p_r": pr, "p_f": pf, "p_z": pz, "q": q, "m": particles["m"]}
 
     def deposit(pp):
@@ -53,10 +55,20 @@ def step_dxi(particles, fields, currents, rho_beam, p):
 
 
 def march(init_particles, init_fields, init_currents, rho_beam_seq, p):
-    """Run the xi-march. rho_beam_seq: (n_layers, n_cells). Returns Ez-on-axis history."""
+    """Run the xi-march. rho_beam_seq: (n_layers, n_cells). Returns Ez-on-axis history.
+
+    Set p["checkpoint"]=True to wrap each xi-step in jax.checkpoint (remat): recompute the
+    layer in the backward pass instead of storing its tape, which makes reverse-mode grad
+    over long marches feasible in memory.
+    """
+    def _step(particles, fields, currents, rho_beam):   # p closed over (static)
+        return step_dxi(particles, fields, currents, rho_beam, p)
+    if p.get("checkpoint", False):
+        _step = jax.checkpoint(_step)
+
     def body(carry, rho_beam):
         particles, fields, currents = carry
-        particles, fields, currents = step_dxi(particles, fields, currents, rho_beam, p)
+        particles, fields, currents = _step(particles, fields, currents, rho_beam)
         return (particles, fields, currents), fields["E_z"][0]
 
     (pf, ff, cf), ez_axis = jax.lax.scan(

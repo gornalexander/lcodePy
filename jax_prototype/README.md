@@ -28,9 +28,12 @@ PYTHONPATH=$(git rev-parse --show-toplevel) python validate_field_solver.py
       matches numba to mean 5e-9 (max 4e-5 of peak) over 301 layers; gradient through the whole
       march matches finite differences (~1e-4). (Outer step_dxi substepping omitted — weak-driver
       regime; needs a bounded form for the general case, like the mover in M3.)
-- [ ] M5 — Full single time step incl. beam push; validate vs LCODE end-to-end at a relaxed
-      tolerance; gradient-optimisation demo. Also: bounded outer substepping; `jax.checkpoint`
-      for memory on long marches.
+- [x] **M5 — Differentiable optimization demo** (`optimize_demo.py`): end-to-end gradient-based
+      **inverse design** — a differentiable rigid Gaussian driver feeds the JAX march; `jax.grad`
+      (with `jax.checkpoint` for memory) drives Adam to recover the driver radius that produces a
+      target wake (σ=1.24 vs true 1.2, ~3% from σ_start=2.5). This is the Branch-2 payoff. Still
+      open (real-implementation phase, not de-risking): **self-consistent beam push** (beam
+      evolving in the wake), bounded **outer** step_dxi substepping, GPU run, float32/perf tuning.
 
 ## M1 results (2026-07-01, CPU, float64)
 - **Accuracy vs numba `compute_fields`** on all 6 reference states: worst **3.9e-12** relative
@@ -74,6 +77,18 @@ new numerical risk.
   calls step_dxi/deposit with a fake beam; capturing per-layer data must disable warmup, or
   the JAX march is driven by 2 spurious layers (this caused a spurious 3.5% mismatch until
   found). `validate_march.py` disables warmup during capture.
+
+## M5 results (2026-07-01, CPU, float64)
+- **End-to-end differentiable inverse design** (`optimize_demo.py`): objective = match a target
+  trailing-wake energy by tuning the driver radius σ. `jax.grad` through the full 100-layer
+  march (with `jax.checkpoint`) + Adam recovers **σ ≈ 1.24 vs true 1.2** (~3%) from σ_start=2.5,
+  monotone loss decrease — verified against a σ-scan. This is the capability that justifies
+  Branch 2 (impossible with the numba code).
+- **Performance note:** reverse-mode grad through the nested scans is heavy; needs
+  `jax.checkpoint` (remat) on the ξ-step and a small bounded `n_attempts` for the mover
+  (~0.6 s/grad at 100 layers after a ~4 s compile). GPU + float32 would speed this up a lot.
+- **Deferred to a real implementation phase** (not de-risking): self-consistent beam push
+  (beam evolving in the wake), bounded outer step_dxi substepping, GPU execution, perf tuning.
 
 ## Notes
 - `jax_enable_x64` is required to match numba float64 (JAX defaults to float32).
