@@ -20,9 +20,10 @@ Public API
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from . import field_solver, deposition, move, march, beam, dynamics
+from . import field_solver, deposition, move, march, beam, dynamics, pipelined
 
 from .march import march, march_with_fields, step_dxi, FIELD_KEYS
+from .pipelined import wavefront_marches, sequential_marches
 from .deposition import compute_rhoj, cell_volume
 from .move import move_particles
 from .field_solver import compute_fields
@@ -36,4 +37,5 @@ __all__ = [
     "compute_rhoj", "cell_volume", "move_particles", "compute_fields",
     "deposit_beam_layer", "deposit_beam_full", "push_beam_layer",
     "init_substepping", "one_time_step", "push_beam_history",
+    "pipelined", "wavefront_marches", "sequential_marches",
 ]
