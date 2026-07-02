@@ -8,8 +8,13 @@ evolving beam. Captures, so the JAX backends can start from an identical state a
   - beam <p_z>, rms r after evolution   -> stats_numba.npy
 and times the n_t-step evolution.
 
-Capture is done by monkeypatching the numba beam-deposition and plasma-solver (the same trick
-the validation notebooks use) — no changes to lcode itself.
+IMPORTANT: the beam only chains across time steps *within a single* `sim.step(N)` call
+(`step()` regenerates a fresh beam + rebuilds the transport every call). So we evolve with ONE
+`sim.step(n_t)` and delineate the per-step beam by hooking `step_dt`. (Calling `sim.step(1)`
+repeatedly would re-inject the initial beam each time -> a rigid, non-evolving driver.)
+
+Capture is done by monkeypatching the numba beam-deposition, plasma-solver and step_dt — no
+changes to lcode itself.
 """
 import io, contextlib, time
 import numpy as np
@@ -30,69 +35,70 @@ CONFIG = {"geometry": "2d", "processing-unit-type": "cpu", "window-width": WW,
 BEAM = {"current": -0.05, "particles_in_layer": 200,
         "default": {"angspread": 1e-5, "energy": 1000},
         "driver": {"xishape": "l", "length": 3, "radius": 1.0}}
-
+KEYS = ("id", "r", "xi", "p_z", "p_r", "M", "q_m", "q_norm")
 print(f"grid NC={NC} NXI={NXI}  n_t={N_T}", flush=True)
 
 # ---------------------------------------------------------------- capture hooks
-_capture_beam = {"on": False, "cols": None}
-_orig_deposit = nbeamcalc.BeamCalculator2D.deposit_beam_layer
-def _deposit(self, layer, xi_i):
-    if _capture_beam["on"] and layer.size:
-        for k in _capture_beam["cols"]:
-            _capture_beam["cols"][k].append(np.array(getattr(layer, k)))
-    return _orig_deposit(self, layer, xi_i)
-nbeamcalc.BeamCalculator2D.deposit_beam_layer = _deposit
+_cap = {"cols": None}                                  # per-step beam buffer (None = off)
+_orig_dep = nbeamcalc.BeamCalculator2D.deposit_beam_layer
+def _dep(self, layer, xi_i):
+    if _cap["cols"] is not None and layer.size:
+        for k in _cap["cols"]:
+            _cap["cols"][k].append(np.array(getattr(layer, k)))
+    return _orig_dep(self, layer, xi_i)
+nbeamcalc.BeamCalculator2D.deposit_beam_layer = _dep
 
-_capture_ez = {"on": False, "ez": None, "k": 0}
-_orig_stepdxi = CylindricalPlasmaSolver.step_dxi
-def _stepdxi(self, particles, fields, currents, const_arrays, rho_beam, rho_beam_prev):
-    particles, fields, currents = _orig_stepdxi(self, particles, fields, currents,
-                                                const_arrays, rho_beam, rho_beam_prev)
-    if _capture_ez["on"] and _capture_ez["k"] < NXI:
-        _capture_ez["ez"][_capture_ez["k"]] = fields.E_z[0]
-        _capture_ez["k"] += 1
+_ez = {"arr": None, "k": 0, "on": False}
+_orig_sdxi = CylindricalPlasmaSolver.step_dxi
+def _sdxi(self, particles, fields, currents, ca, rb, rbp):
+    particles, fields, currents = _orig_sdxi(self, particles, fields, currents, ca, rb, rbp)
+    if _ez["on"] and _ez["k"] < NXI:
+        _ez["arr"][_ez["k"]] = fields.E_z[0]; _ez["k"] += 1
     return particles, fields, currents
-CylindricalPlasmaSolver.step_dxi = _stepdxi
+CylindricalPlasmaSolver.step_dxi = _sdxi
 
+per_step = []                                          # one beam dict per time step
+_capture = {"on": True}
+_orig_sdt = nps.PusherAndSolver.step_dt
+def _sdt(self, *a, **k):
+    if not _capture["on"]:
+        return _orig_sdt(self, *a, **k)
+    _cap["cols"] = {kk: [] for kk in KEYS}
+    r = _orig_sdt(self, *a, **k)
+    per_step.append({kk: (np.concatenate(v) if v else np.array([])) for kk, v in _cap["cols"].items()})
+    _cap["cols"] = None
+    return r
+nps.PusherAndSolver.step_dt = _sdt
+nps.PusherAndSolver.warmup = lambda self, *a, **k: None      # skip built-in JIT warmup
 
-def capture_beam_on():
-    _capture_beam["cols"] = {k: [] for k in ("r", "xi", "p_z", "p_r", "M", "q_m", "q_norm")}
-    _capture_beam["on"] = True
-def capture_beam_off():
-    _capture_beam["on"] = False
-    return {k: np.concatenate(v) for k, v in _capture_beam["cols"].items()}
-
-
-nps.PusherAndSolver.warmup = lambda self, *a, **k: None       # skip 2-step JIT warmup
 sim = lcode.Simulation(config=dict(CONFIG), beam_parameters=BEAM, diagnostics=[], runas_filename="")
 
-# --- step 1: capture initial beam + step-1 wake Ez(xi); also compiles the kernels
-# NOTE: sim.step(1) runs exactly ONE time step (sim.step() with no arg runs time-limit/time-step).
-_capture_ez["ez"] = np.empty(NXI); _capture_ez["k"] = 0; _capture_ez["on"] = True
-capture_beam_on()
+# --- warm up (compile numba kernels); discard captured beam
 with contextlib.redirect_stdout(io.StringIO()):
     sim.step(1)
-beam_init = capture_beam_off()
-_capture_ez["on"] = False
-ez_numba = _capture_ez["ez"].copy()
-np.savez("beam_init.npz", **beam_init)
-np.save("ez_numba.npy", ez_numba)
-print(f"initial beam: {beam_init['r'].size} particles, mean p_z={beam_init['p_z'].mean():.1f}")
-print(f"step-1 wake Ez(xi): min={ez_numba.min():.4e} max={ez_numba.max():.4e}", flush=True)
+per_step.clear()
 
-# --- run to n_t steps, capturing the beam at the last step for stats
-t0 = time.perf_counter()
-for i in range(2, N_T + 1):
-    last = (i == N_T)
-    if last:
-        capture_beam_on()
-    with contextlib.redirect_stdout(io.StringIO()):
-        sim.step(1)
-    if last:
-        beam_final = capture_beam_off()
-elapsed = time.perf_counter() - t0
+# --- ONE chained run of n_t steps; capture per-step beam + step-1 wake Ez(xi)
+_ez["arr"] = np.empty(NXI); _ez["k"] = 0; _ez["on"] = True
+with contextlib.redirect_stdout(io.StringIO()):
+    sim.step(N_T)
+_ez["on"] = False
+ez_numba = _ez["arr"].copy()
+beam_init = {k: per_step[0][k] for k in per_step[0]}          # 0 pushes
+beam_final = per_step[N_T - 1]                                # after n_t-1 pushes
+np.savez("beam_init.npz", **{k: beam_init[k] for k in ("r", "xi", "p_z", "p_r", "M", "q_m", "q_norm")})
+np.save("ez_numba.npy", ez_numba)
 stats = np.array([beam_final["p_z"].mean(), np.sqrt(np.mean(beam_final["r"] ** 2))])
 np.save("stats_numba.npy", stats)
-print(f"after evolution: mean p_z={stats[0]:.3f}  rms r={stats[1]:.4f}")
-print(f"\nNUMBA (CPU): {N_T - 1} evolving steps in {elapsed:.3f}s -> {elapsed/(N_T-1)*1e3:.1f} ms/step",
+print(f"initial beam: {beam_init['r'].size} particles, mean p_z={beam_init['p_z'].mean():.1f}")
+print(f"step-1 wake Ez(xi): min={ez_numba.min():.4e} max={ez_numba.max():.4e}")
+print(f"after {N_T-1} evolving steps: mean p_z={stats[0]:.3f}  rms r={stats[1]:.4f}", flush=True)
+
+# --- timing: another chained n_t-step run, capture off
+_capture["on"] = False
+t0 = time.perf_counter()
+with contextlib.redirect_stdout(io.StringIO()):
+    sim.step(N_T)
+elapsed = time.perf_counter() - t0
+print(f"\nNUMBA (CPU): {N_T} chained steps in {elapsed:.3f}s -> {elapsed/N_T*1e3:.1f} ms/step",
       flush=True)
