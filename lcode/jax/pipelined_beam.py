@@ -71,9 +71,13 @@ def fused_time_step(plasma0, beam, msub, p):
 
 
 def sequential_fused_evolve(plasma0, beam, msub, p, n_steps):
-    """Evolve the beam for `n_steps` time steps, one after another (correctness oracle)."""
-    for _ in range(n_steps):
-        beam = fused_time_step(plasma0, beam, msub, p)
+    """Evolve the beam for `n_steps` time steps, one after another (correctness oracle).
+
+    Uses lax.scan over time steps (not a Python unroll) so the compiled graph stays small.
+    """
+    def body(beam, _):
+        return fused_time_step(plasma0, beam, msub, p), None
+    beam, _ = jax.lax.scan(body, beam, None, length=n_steps)
     return beam
 
 
