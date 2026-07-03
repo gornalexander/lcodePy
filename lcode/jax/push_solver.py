@@ -26,6 +26,11 @@ class JaxPusherAndSolver2D:
         self.dxi = config.getfloat('xi-step')
         self.time_step = config.getfloat('time-step')
         self.substep_energy = config.getfloat('beam-substepping-energy')
+        # 'wavefront' (default: on-device time-step pipeline) or 'sequential' (fallback, and used
+        # automatically when diagnostics or the field-history flag are active, since the wavefront
+        # keeps no per-step history).
+        self.pipeline = config.get('pipeline', 'wavefront')
+        self.save_field_history = config.getbool('save-field-history')
         self._plasma, self._params = _build_solver_state(config)
         self._step_cache = {}                # jitted one-step per substep depth
         self._plasmastate = None
@@ -42,8 +47,11 @@ class JaxPusherAndSolver2D:
 
     def run(self, n_steps, beam_array, diagnostics_list, current_time):
         """Evolve `beam_array` for `n_steps` time steps on-device; store the final plasma state."""
+        keep_history = bool(diagnostics_list) or self.save_field_history
+        if self.pipeline == 'wavefront':
+            self._run_wavefront(n_steps, beam_array, diagnostics_list, current_time, keep_history)
+            return
         beam, _ = _beam_dict(beam_array)          # jax arrays, stays on-device across steps
-        keep_history = bool(diagnostics_list)     # only cross to host when a diagnostic wants it
         t = current_time
         electrons = fields = currents = ions = None
 
@@ -58,7 +66,8 @@ class JaxPusherAndSolver2D:
             if keep_history:
                 history_host = {k: np.asarray(history[k]) for k in FIELD_KEYS}
                 self._field_history = history_host
-                self._run_diagnostics(diagnostics_list, t, electrons, currents, history_host)
+                if diagnostics_list:
+                    self._run_diagnostics(diagnostics_list, t, electrons, currents, history_host)
             t += self.time_step
 
         jax.block_until_ready(electrons["r"])
@@ -71,6 +80,53 @@ class JaxPusherAndSolver2D:
         self._plasmastate = (particles, plasma_fields, plasma_currents)
         if not keep_history:
             self._field_history = None
+
+    def _run_wavefront(self, n_steps, beam_array, diagnostics_list, current_time, keep_history):
+        """Evolve the beam as a diagonal wavefront over time steps (on-device pipeline, #19).
+
+        With `keep_history` the per-(time step, xi-layer) wake fields are returned too, so
+        diagnostics and `_field_history` work on the wavefront just like the sequential driver.
+        """
+        import jax.numpy as jnp
+        from . import init_substepping
+        from .beam_layered import bucket_beam, wavefront_evolve
+
+        bucket, _ = bucket_beam(beam_array, self._params["n_xi"], self.dxi)
+        zero = jnp.zeros_like(bucket["p_z"])
+        _, remaining = init_substepping(bucket["p_z"], bucket["q_m"], zero, zero,
+                                        self.time_step, self.substep_energy)
+        remaining = jnp.where(bucket["active"], remaining, 0)
+        max_substeps = int(np.asarray(remaining).max())
+        ions = self._plasma.get("ions")
+
+        _evolved, final, history = wavefront_evolve(
+            bucket, self._plasma, self._params, self.time_step, self.substep_energy, n_steps,
+            ions0=ions, max_substeps=max_substeps, keep_history=keep_history)
+        if ions is None:
+            electrons, fields, currents = final
+            ion_sp = None
+        else:
+            electrons, ion_sp, fields, currents = final
+        particles = {"electrons": _to_arrays(electrons)}
+        if ion_sp is not None:
+            particles["ions"] = _to_arrays(ion_sp)
+        plasma_fields = Arrays(xp=np, **{k: np.asarray(fields[k]) for k in FIELD_KEYS})
+        plasma_currents = Arrays(xp=np, **{k: np.asarray(currents[k])
+                                           for k in ("rho", "j_r", "j_f", "j_z")})
+        self._plasmastate = (particles, plasma_fields, plasma_currents)
+
+        if history is None:
+            self._field_history = None
+            return
+        # history[k]: [n_steps, n_layers, n_cells]. Expose the last step's history and, if any
+        # diagnostics are active, replay them per time step (fields exact; final-lane particles).
+        history_host = {k: np.asarray(history[k]) for k in FIELD_KEYS}
+        self._field_history = {k: history_host[k][-1] for k in FIELD_KEYS}
+        if diagnostics_list:
+            for step in range(n_steps):
+                step_hist = {k: history_host[k][step] for k in FIELD_KEYS}
+                self._run_diagnostics(diagnostics_list, current_time + step * self.time_step,
+                                      electrons, currents, step_hist)
 
     def _run_diagnostics(self, diagnostics_list, current_time, electrons, currents, history):
         """Replay per-xi-layer diagnostics from the wake-field history (fields-level).

@@ -3,8 +3,17 @@
 default_config_values = {
     'geometry': 'circ', # 'circ' or '3d'
 
-    # Compute backend: 'numba' (default) or 'jax' (differentiable 2D, background ions only).
+    # Compute backend: 'numba' (default) or 'jax' (differentiable 2D, on-device pipeline).
     'backend': 'numba',
+
+    # JAX time-step driver: 'wavefront' (default: on-device pipeline over time steps) or
+    # 'sequential' (step-by-step; used automatically when diagnostics are active).
+    'pipeline': 'wavefront',
+
+    # JAX: keep the per-xi wake-field history on the last step (fields-vs-xi diagnostics /
+    # notebooks). Off by default (the history is a large device->host copy); forces the
+    # sequential driver when on.
+    'save-field-history': False,
 
     # MPI inter-process transport: 'memory' (fast, requires RAM) or 'disk' (slower, saves RAM).
     'mpi-transport': 'memory',
