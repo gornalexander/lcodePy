@@ -54,6 +54,62 @@ def step_dxi(particles, fields, currents, rho_beam, p):
     return p_new, fields_new, c_new
 
 
+def step_dxi_ions(electrons, ions, fields, currents, rho_beam, p):
+    """One xi-step with mobile ions: move & deposit BOTH species (electrons + ions).
+
+    Same predictor-corrector as `step_dxi`, but a second heavy positive species is pushed by the
+    same fields and deposited into row 1 of the currents (instead of the static background `ni`).
+    Returns (electrons_new, ions_new, fields_new, currents_new).
+    """
+    n, h, xi = p["n_cells"], p["r_step"], p["xi_step"]
+    vol, ni, mr = p["vol"], p["ni"], p["max_radius"]
+    n_attempts = p.get("n_attempts", jm.N_SUBSTEP_ATTEMPTS)
+
+    def move(pp, f):
+        r, pr, pf, pz, q = jm.move_particles(
+            f["E_r"], f["E_f"], f["E_z"], f["B_f"], f["B_z"],
+            pp["r"], pp["p_r"], pp["p_f"], pp["p_z"], pp["q"], pp["m"],
+            h, xi, mr, n_attempts=n_attempts)
+        return {"r": r, "p_r": pr, "p_f": pf, "p_z": pz, "q": q, "m": pp["m"]}
+
+    def deposit(e, i):
+        return jdep.compute_rhoj(e, n, h, vol, ni, ions=i)
+
+    # Predictor
+    e_new = move(electrons, fields)
+    i_new = move(ions, fields)
+    c_new = deposit(e_new, i_new)
+
+    # Correctors (each re-moves from the ORIGINAL species with the averaged field)
+    fields_new = fields
+    for _ in range(p["corrector_steps"]):
+        fields_new, favg = jfs.compute_fields(fields_new, fields, rho_beam,
+                                              currents, c_new, xi, h)
+        e_new = move(electrons, favg)
+        i_new = move(ions, favg)
+        c_new = deposit(e_new, i_new)
+    return e_new, i_new, fields_new, c_new
+
+
+def march_with_fields_ions(electrons, ions, fields, currents, rho_beam_seq, p):
+    """Like `march_with_fields`, but with mobile ions (see `step_dxi_ions`).
+
+    Returns (field_hist, (electrons_final, ions_final, fields_final, currents_final))."""
+    def _step(e, i, f, c, rho_beam):
+        return step_dxi_ions(e, i, f, c, rho_beam, p)
+    if p.get("checkpoint", False):
+        _step = jax.checkpoint(_step)
+
+    def body(carry, rho_beam):
+        e, i, f, c = carry
+        e, i, f, c = _step(e, i, f, c, rho_beam)
+        return (e, i, f, c), f
+
+    (ef, iff, ff, cf), field_hist = jax.lax.scan(
+        body, (electrons, ions, fields, currents), rho_beam_seq)
+    return field_hist, (ef, iff, ff, cf)
+
+
 def march(init_particles, init_fields, init_currents, rho_beam_seq, p):
     """Run the xi-march. rho_beam_seq: (n_layers, n_cells). Returns Ez-on-axis history.
 

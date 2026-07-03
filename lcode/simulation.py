@@ -283,6 +283,12 @@ class Simulation:
                   f"the code will simulate till time limit = {self.__time_limit},",
                   f"with a time step size = {self.__time_step_size}.")
 
+        # Backend switch: run the differentiable JAX solver instead of numba.
+        if self.__config.get('backend', 'numba').lower() == 'jax':
+            self._step_jax(N_steps)
+            print('The work is done!')
+            return
+
         ctx = MPIContext()
         backend = self.__config.get('mpi-transport', 'memory')
 
@@ -318,3 +324,30 @@ class Simulation:
 
         transport.close()
         print('The work is done!')
+
+    def _step_jax(self, N_steps):
+        """Run N_steps time steps with the JAX backend and store the final plasma state.
+
+        2D, ion-model 'background' or 'mobile'. Populates ``self.__push_solver._plasmastate`` in
+        the same ``Arrays`` format as the numba solver, so diagnostics / tests read it unchanged.
+        """
+        if self.__geometry != '2d':
+            raise NotImplementedError("The JAX backend currently supports 2D only.")
+        if self.__rigid_beam:
+            raise NotImplementedError("The JAX backend does not support rigid beams.")
+        if self.__config.get('ion-model') not in ('background', 'mobile'):
+            import warnings
+            warnings.warn("JAX backend supports ion-model 'background' or 'mobile'; "
+                          f"config asks for ion-model='{self.__config.get('ion-model')}'. "
+                          "Running with background ions.")
+        from .jax.backend import run_2d
+        # Use a pre-loaded beam if one was set (load_beamfile / injected), else generate it —
+        # mirrors the numba path, so both backends can run the identical initial beam.
+        if self.__beam_particles is not None:
+            beam_particles = self.__beam_particles
+        else:
+            beam_particles = generate_beam(self.__config, self.beam_parameters)
+        particles, fields, currents, field_history = run_2d(self.__config, beam_particles, N_steps)
+        self.__push_solver._plasmastate = (particles, fields, currents)
+        self.__push_solver._field_history = field_history   # wake fields vs xi (diagnostics)
+        self.current_time = N_steps * self.__time_step_size

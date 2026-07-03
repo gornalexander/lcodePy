@@ -122,12 +122,18 @@ def pipelined_evolve(plasma0, beam, msub, p, n_steps):
         rho_layout = sel(rl_next, rho_layout)
 
         # hand-off: lane p's pushed bucket at layer j -> lane p+1's input bucket at layer j.
-        # write to a scratch lane P for inactive / last-lane pushes (absorbed, discarded).
-        tgt = jnp.where(active & (lanes + 1 < P), lanes + 1, P)
-        beam_pad = {k: jnp.concatenate([beamP[k], jnp.zeros((1, n_xi) + beamP[k].shape[2:])], 0)
-                    for k in beamP}
-        beam_pad = {k: beam_pad[k].at[tgt, jc].set(out[k]) for k in beam_pad}
-        beamP = {k: beam_pad[k][:P] for k in beam_pad}
+        # Indexed by the receiving lane q = p+1: lane q gets out[q-1] at layer jc[q-1] (a single
+        # masked scatter per lane, no per-tick concatenate -> far cheaper to compile/run).
+        tgt_layer = jnp.roll(jc, 1)                       # layer q receives at
+        valid = (lanes >= 1) & jnp.roll(active, 1)        # only if lane q-1 was active
+        vmask = valid.reshape((P,) + (1,) * (beamP["r"].ndim - 2))
+        newbeam = {}
+        for k in beamP:
+            src = jnp.roll(out[k], 1, axis=0)             # src[q] = out[q-1]
+            existing = beamP[k][lanes, tgt_layer]
+            newval = jnp.where(vmask, src, existing)
+            newbeam[k] = beamP[k].at[lanes, tgt_layer].set(newval)
+        beamP = newbeam
         return (particles, fields, currents, rho_layout, beamP), out
 
     carry0 = (particles, fields, currents, rho_layout, beamP)

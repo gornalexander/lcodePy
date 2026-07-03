@@ -3,6 +3,9 @@
 default_config_values = {
     'geometry': 'circ', # 'circ' or '3d'
 
+    # Compute backend: 'numba' (default) or 'jax' (differentiable 2D, background ions only).
+    'backend': 'numba',
+
     # MPI inter-process transport: 'memory' (fast, requires RAM) or 'disk' (slower, saves RAM).
     'mpi-transport': 'memory',
 

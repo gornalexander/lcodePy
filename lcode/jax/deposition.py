@@ -67,18 +67,28 @@ def deposit_plasma(r, p_r, p_f, p_z, q, m, n_cells, r_step):
     return rho, j_r, j_f, j_z
 
 
-def compute_rhoj(particles, n_cells, r_step, vol, ni):
-    """Port of get_rhoj_computer.compute_rhoj for a single (electron) species + background ions.
+def compute_rhoj(particles, n_cells, r_step, vol, ni, ions=None):
+    """Port of get_rhoj_computer.compute_rhoj. Row 0 is the electrons; row 1 is the ions.
 
-    `particles` is a dict with r, p_r, p_f, p_z, q, m. Returns dict of (2, n) arrays.
+    `particles` (and `ions`) are dicts with r, p_r, p_f, p_z, q, m. Returns dict of (2, n) arrays.
+    With `ions=None` the ion row is the static background charge density `ni` (ion-model
+    'background'); with an `ions` species it is that species' deposited rho/j (ion-model 'mobile').
     """
     rho0, j_r0, j_f0, j_z0 = deposit_plasma(
         particles["r"], particles["p_r"], particles["p_f"], particles["p_z"],
         particles["q"], particles["m"], n_cells, r_step)
 
-    zeros = jnp.zeros(n_cells, dtype=rho0.dtype)
-    rho = jnp.stack([rho0 / vol, jnp.full(n_cells, ni, dtype=rho0.dtype)])
-    j_r = jnp.stack([j_r0 / vol, zeros])
-    j_f = jnp.stack([j_f0 / vol, zeros])
-    j_z = jnp.stack([j_z0 / vol, zeros])
+    if ions is None:
+        zeros = jnp.zeros(n_cells, dtype=rho0.dtype)
+        rho1, j_r1, j_f1, j_z1 = jnp.full(n_cells, ni, dtype=rho0.dtype), zeros, zeros, zeros
+    else:
+        ri, jri, jfi, jzi = deposit_plasma(
+            ions["r"], ions["p_r"], ions["p_f"], ions["p_z"],
+            ions["q"], ions["m"], n_cells, r_step)
+        rho1, j_r1, j_f1, j_z1 = ri / vol, jri / vol, jfi / vol, jzi / vol
+
+    rho = jnp.stack([rho0 / vol, rho1])
+    j_r = jnp.stack([j_r0 / vol, j_r1])
+    j_f = jnp.stack([j_f0 / vol, j_f1])
+    j_z = jnp.stack([j_z0 / vol, j_z1])
     return {"rho": rho, "j_r": j_r, "j_f": j_f, "j_z": j_z}
