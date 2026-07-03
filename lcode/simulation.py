@@ -117,7 +117,13 @@ class Simulation:
             
         elif self.__geometry == '2d':
             self.particle_dtype = particle_dtype
-            self.__push_solver = PusherAndSolver2D(config=self.__config)
+            # Backend switch: the JAX push-solver implements the same step_dt contract as the
+            # numba one, so Simulation.step() runs one shared pipeline for both.
+            if self.__config.get('backend', 'numba').lower() == 'jax':
+                from .jax.push_solver import JaxPusherAndSolver2D
+                self.__push_solver = JaxPusherAndSolver2D(self.__config)
+            else:
+                self.__push_solver = PusherAndSolver2D(config=self.__config)
             self.init_plasma, self.__load_plasma = \
                 init_plasma_2d, load_plasma_2d
             self.BeamParticles, self.BeamSource, self.BeamDrain = \
@@ -283,11 +289,83 @@ class Simulation:
                   f"the code will simulate till time limit = {self.__time_limit},",
                   f"with a time step size = {self.__time_step_size}.")
 
-        # Backend switch: run the differentiable JAX solver instead of numba.
+        # Beam particles for this run (shared by both backends).
+        if self.__rigid_beam:
+            beam_particles = self.beam_parameters
+        elif self.__beam_particles is None:
+            beam_particles = generate_beam(self.__config, self.beam_parameters)
+        else:
+            beam_particles = self.__beam_particles
+
+        # JAX backend: its own on-device time-step driver, no MPI (MPI is numba's cross-process
+        # pipeline; JAX parallelises on-device). The beam stays on-device across time steps.
         if self.__config.get('backend', 'numba').lower() == 'jax':
-            self._step_jax(N_steps)
+            self.current_time = self.__time_step_size
+            self.__push_solver.run(N_steps, beam_particles,
+                                   self.diagnostics_list, self.current_time)
+            self.current_time = N_steps * self.__time_step_size
             print('The work is done!')
             return
+
+        # numba backend: MPI per-layer transport pipeline (overlaps time steps across ranks).
+        ctx = MPIContext()
+        backend = self.__config.get('mpi-transport', 'memory')
+
+        transport = self._build_transport(ctx, N_steps, beam_particles, backend)
+        reconstruct_fn = self._make_reconstruct_fn(ctx)
+
+        self.beam_source = MPIBeamSource(transport, reconstruct_fn)
+        self.beam_drain  = MPIBeamDrain(transport, reconstruct_fn)
+
+        self.current_time = self.__time_step_size * (ctx.rank + 1)
+
+        warmup_plasma = self.init_plasma(self.__config, 0.0)
+        self.__push_solver.warmup(warmup_plasma, rank=ctx.rank)
+
+        for _ in range(transport.steps_per_node):
+            plasma_state = self.__init_plasma_state(self.current_time)
+
+            self.__push_solver.step_dt(
+                *plasma_state, self.beam_source, self.beam_drain,
+                self.current_time, self.diagnostics_list
+            )
+
+            transport.next_step()
+            self.current_time += self.__time_step_size * ctx.size
+
+        transport.close()
+        print('The work is done!')
+    
+    def _step_numba(self, N_steps=None):
+        """
+        Compute N time steps.
+
+        Parametrs
+        ---------
+
+        N_steps : int, optional
+                Number of time steps that will be made. 
+                Default : N_steps = time_limit / time_step.
+        """
+        if self.runas_filename:
+            self.__config.dump(self.runas_filename)
+
+        # t step function, makes N_steps time steps.
+        if self.__rigid_beam:
+            N_steps = 1
+            print("Since the beam is rigid, the code will simulate only one " +
+                  "time step.")
+        elif N_steps is None:
+            N_steps = int(self.__time_limit / self.__time_step_size)
+            print("Since the number of time steps hasn't been set explicitly,",
+                  f"the code will simulate {N_steps} time steps with a time",
+                  f"step size = {self.__time_step_size}.")
+        else:
+            self.__time_limit = \
+                N_steps * self.__time_step_size + self.current_time
+            print("Since the number of time steps has been set explicitly,",
+                  f"the code will simulate till time limit = {self.__time_limit},",
+                  f"with a time step size = {self.__time_step_size}.")
 
         ctx = MPIContext()
         backend = self.__config.get('mpi-transport', 'memory')

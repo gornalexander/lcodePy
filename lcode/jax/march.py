@@ -1,15 +1,15 @@
 """
-JAX assembly of one xi-layer (predictor-corrector) and the full xi-march (M4).
+The xi-march: one predictor-corrector plasma layer (`step_dxi`) and the full sweep (`march`).
 
-Combines the validated M1-M3 kernels (field_solver_jax, deposition_jax, move_jax) into:
-  - step_dxi: predictor (move + deposit) then `corrector_steps` x (fields + move + deposit),
-  - march:    lax.scan over xi-layers, driven by a precomputed rho_beam[xi, r].
+`step_dxi` advances the plasma by one xi-layer; `march` scans it over all layers, driven by a
+precomputed rho_beam[xi, r]. Both take an optional second `ions` species (ion-model 'mobile'):
+when given, the ions are pushed by the same fields and deposited into row 1 of the currents;
+when None (ion-model 'background') row 1 is the static background density `ni`.
 
-The OUTER step_dxi substepping (the coarse xi/10 reduction when charge_move exceeds the
-sensitivity) is another data-dependent while_loop; it is omitted here (fine for the
-weak-driver validation) and will need a bounded/relaxed form for the general case (M5).
+Not yet ported: the OUTER step_dxi substepping (the coarse xi/10 reduction when charge_move
+exceeds the sensitivity). It is data-dependent control flow that needs a bounded scan+mask; see
+issue #21. Fine for weak/moderate drivers, where numba never triggers it either.
 """
-from functools import partial
 import jax
 import jax.numpy as jnp
 
@@ -22,129 +22,74 @@ jax.config.update("jax_enable_x64", True)
 FIELD_KEYS = ("E_r", "E_f", "E_z", "B_f", "B_z")
 
 
-def step_dxi(particles, fields, currents, rho_beam, p):
-    """One xi-step (no outer substepping). particles/fields/currents are dicts."""
-    n, h, xi = p["n_cells"], p["r_step"], p["xi_step"]
-    vol, ni, mr = p["vol"], p["ni"], p["max_radius"]
-
-    n_attempts = p.get("n_attempts", jm.N_SUBSTEP_ATTEMPTS)
-
-    def move(f):
-        r, pr, pf, pz, q = jm.move_particles(
-            f["E_r"], f["E_f"], f["E_z"], f["B_f"], f["B_z"],
-            particles["r"], particles["p_r"], particles["p_f"], particles["p_z"],
-            particles["q"], particles["m"], h, xi, mr, n_attempts=n_attempts)
-        return {"r": r, "p_r": pr, "p_f": pf, "p_z": pz, "q": q, "m": particles["m"]}
-
-    def deposit(pp):
-        return jdep.compute_rhoj(pp, n, h, vol, ni)
-
-    # Predictor
-    p_new = move(fields)
-    c_new = deposit(p_new)
-
-    # Correctors
-    fields_new = fields
-    for _ in range(p["corrector_steps"]):
-        fields_new, favg = jfs.compute_fields(fields_new, fields, rho_beam,
-                                              currents, c_new, xi, h)
-        # compute_fields returns dicts missing nothing; ensure all field keys present
-        p_new = move(favg)
-        c_new = deposit(p_new)
-    return p_new, fields_new, c_new
+def _move_species(species, fields, params):
+    """Push one plasma species in `fields`; returns the updated species dict (mass unchanged)."""
+    r, p_r, p_f, p_z, q = jm.move_particles(
+        fields["E_r"], fields["E_f"], fields["E_z"], fields["B_f"], fields["B_z"],
+        species["r"], species["p_r"], species["p_f"], species["p_z"],
+        species["q"], species["m"], params["r_step"], params["xi_step"], params["max_radius"],
+        n_attempts=params.get("n_attempts", jm.N_SUBSTEP_ATTEMPTS))
+    return {"r": r, "p_r": p_r, "p_f": p_f, "p_z": p_z, "q": q, "m": species["m"]}
 
 
-def step_dxi_ions(electrons, ions, fields, currents, rho_beam, p):
-    """One xi-step with mobile ions: move & deposit BOTH species (electrons + ions).
+def step_dxi(electrons, fields, currents, rho_beam, params, ions=None):
+    """One xi-step (predictor + `corrector_steps` correctors), no outer substepping.
 
-    Same predictor-corrector as `step_dxi`, but a second heavy positive species is pushed by the
-    same fields and deposited into row 1 of the currents (instead of the static background `ni`).
-    Returns (electrons_new, ions_new, fields_new, currents_new).
+    Returns (electrons, fields, currents) for background, or (electrons, ions, fields, currents)
+    when a mobile `ions` species is given. Each corrector re-moves from the ORIGINAL species with
+    the freshly averaged field, matching numba's predictor-corrector.
     """
-    n, h, xi = p["n_cells"], p["r_step"], p["xi_step"]
-    vol, ni, mr = p["vol"], p["ni"], p["max_radius"]
-    n_attempts = p.get("n_attempts", jm.N_SUBSTEP_ATTEMPTS)
+    def deposit(moved_electrons, moved_ions):
+        return jdep.compute_rhoj(moved_electrons, params["n_cells"], params["r_step"],
+                                 params["vol"], params["ni"], ions=moved_ions)
 
-    def move(pp, f):
-        r, pr, pf, pz, q = jm.move_particles(
-            f["E_r"], f["E_f"], f["E_z"], f["B_f"], f["B_z"],
-            pp["r"], pp["p_r"], pp["p_f"], pp["p_z"], pp["q"], pp["m"],
-            h, xi, mr, n_attempts=n_attempts)
-        return {"r": r, "p_r": pr, "p_f": pf, "p_z": pz, "q": q, "m": pp["m"]}
+    def advance(fields_for_move):
+        moved_electrons = _move_species(electrons, fields_for_move, params)
+        moved_ions = _move_species(ions, fields_for_move, params) if ions is not None else None
+        return moved_electrons, moved_ions, deposit(moved_electrons, moved_ions)
 
-    def deposit(e, i):
-        return jdep.compute_rhoj(e, n, h, vol, ni, ions=i)
-
-    # Predictor
-    e_new = move(electrons, fields)
-    i_new = move(ions, fields)
-    c_new = deposit(e_new, i_new)
-
-    # Correctors (each re-moves from the ORIGINAL species with the averaged field)
+    electrons_new, ions_new, currents_new = advance(fields)        # predictor
     fields_new = fields
-    for _ in range(p["corrector_steps"]):
-        fields_new, favg = jfs.compute_fields(fields_new, fields, rho_beam,
-                                              currents, c_new, xi, h)
-        e_new = move(electrons, favg)
-        i_new = move(ions, favg)
-        c_new = deposit(e_new, i_new)
-    return e_new, i_new, fields_new, c_new
+    for _ in range(params["corrector_steps"]):                     # correctors
+        fields_new, fields_avg = jfs.compute_fields(fields_new, fields, rho_beam, currents,
+                                                    currents_new, params["xi_step"], params["r_step"])
+        electrons_new, ions_new, currents_new = advance(fields_avg)
+
+    if ions is None:
+        return electrons_new, fields_new, currents_new
+    return electrons_new, ions_new, fields_new, currents_new
 
 
-def march_with_fields_ions(electrons, ions, fields, currents, rho_beam_seq, p):
-    """Like `march_with_fields`, but with mobile ions (see `step_dxi_ions`).
+def march(electrons, fields, currents, rho_beam_seq, params, ions=None, keep_history=False):
+    """Scan `step_dxi` over the xi-layers in `rho_beam_seq` (shape [n_layers, n_cells]).
 
-    Returns (field_hist, (electrons_final, ions_final, fields_final, currents_final))."""
-    def _step(e, i, f, c, rho_beam):
-        return step_dxi_ions(e, i, f, c, rho_beam, p)
-    if p.get("checkpoint", False):
-        _step = jax.checkpoint(_step)
+    Returns (history, final_state):
+      - history is the per-layer wake-field dict F[n_layers, n_cells] if `keep_history`, else the
+        on-axis E_z[n_layers] (cheap diagnostic);
+      - final_state is (electrons, fields, currents), or (electrons, ions, fields, currents) with
+        mobile ions -- the plasma state at the last layer.
 
+    Set params["checkpoint"]=True to rematerialise each layer in the backward pass (memory for grad).
+    """
     def body(carry, rho_beam):
-        e, i, f, c = carry
-        e, i, f, c = _step(e, i, f, c, rho_beam)
-        return (e, i, f, c), f
+        electrons, ions, fields, currents = carry
+        if ions is None:
+            electrons, fields, currents = step_dxi(electrons, fields, currents, rho_beam, params)
+        else:
+            electrons, ions, fields, currents = step_dxi(
+                electrons, fields, currents, rho_beam, params, ions=ions)
+        history_entry = fields if keep_history else fields["E_z"][0]
+        return (electrons, ions, fields, currents), history_entry
 
-    (ef, iff, ff, cf), field_hist = jax.lax.scan(
+    if params.get("checkpoint", False):
+        body = jax.checkpoint(body)
+
+    (electrons, ions, fields, currents), history = jax.lax.scan(
         body, (electrons, ions, fields, currents), rho_beam_seq)
-    return field_hist, (ef, iff, ff, cf)
+    final_state = (electrons, fields, currents) if ions is None else (electrons, ions, fields, currents)
+    return history, final_state
 
 
-def march(init_particles, init_fields, init_currents, rho_beam_seq, p):
-    """Run the xi-march. rho_beam_seq: (n_layers, n_cells). Returns Ez-on-axis history.
-
-    Set p["checkpoint"]=True to wrap each xi-step in jax.checkpoint (remat): recompute the
-    layer in the backward pass instead of storing its tape, which makes reverse-mode grad
-    over long marches feasible in memory.
-    """
-    def _step(particles, fields, currents, rho_beam):   # p closed over (static)
-        return step_dxi(particles, fields, currents, rho_beam, p)
-    if p.get("checkpoint", False):
-        _step = jax.checkpoint(_step)
-
-    def body(carry, rho_beam):
-        particles, fields, currents = carry
-        particles, fields, currents = _step(particles, fields, currents, rho_beam)
-        return (particles, fields, currents), fields["E_z"][0]
-
-    (pf, ff, cf), ez_axis = jax.lax.scan(
-        body, (init_particles, init_fields, init_currents), rho_beam_seq)
-    return ez_axis, (pf, ff, cf)
-
-
-def march_with_fields(init_particles, init_fields, init_currents, rho_beam_seq, p):
-    """Like `march`, but returns the full wake-field history F[k] for each xi-layer k
-    (a dict of (n_layers, n_cells) arrays), for pushing the beam afterwards (MB3)."""
-    def _step(particles, fields, currents, rho_beam):
-        return step_dxi(particles, fields, currents, rho_beam, p)
-    if p.get("checkpoint", False):
-        _step = jax.checkpoint(_step)
-
-    def body(carry, rho_beam):
-        particles, fields, currents = carry
-        particles, fields, currents = _step(particles, fields, currents, rho_beam)
-        return (particles, fields, currents), fields
-
-    (pf, ff, cf), field_hist = jax.lax.scan(
-        body, (init_particles, init_fields, init_currents), rho_beam_seq)
-    return field_hist, (pf, ff, cf)
+def march_with_fields(electrons, fields, currents, rho_beam_seq, params, ions=None):
+    """`march` keeping the full per-layer wake-field history (for pushing the beam afterwards)."""
+    return march(electrons, fields, currents, rho_beam_seq, params, ions=ions, keep_history=True)
